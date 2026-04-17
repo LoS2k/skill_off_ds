@@ -196,8 +196,12 @@ async def on_ready():
     load_rooms(); load_teams()
     bot.add_view(RoleView())
 
-    await tree.sync()
-    print(f"[✓] Slash-команди синхронізовано")
+    # Синхронізуємо slash-команди на конкретний сервер (миттєво)
+    # Глобальна синхронізація без guild= займає до 1 години!
+    guild_obj = discord.Object(id=GUILD_ID)
+    tree.copy_global_to(guild=guild_obj)
+    await tree.sync(guild=guild_obj)
+    print(f"[✓] Slash-команди синхронізовано на сервер {GUILD_ID}")
 
     guild = bot.get_guild(GUILD_ID)
     if not guild:
