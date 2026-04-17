@@ -20,9 +20,11 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import View
-import asyncio, json, os
+import asyncio, json, os, time
 from datetime import datetime
 from dotenv import load_dotenv
+import aiohttp
+import feedparser
 
 load_dotenv()
 
@@ -46,6 +48,17 @@ CH_BRACKET  = "розклад"
 
 STATE_FILE = "rooms_state.json"
 TEAMS_FILE = "teams_data.json"
+
+# ── Сповіщення про стріми ─────────────────────────────────────────────────────
+TWITCH_CLIENT_ID     = os.getenv("TWITCH_CLIENT_ID", "")
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
+NOTIFY_CHANNEL_NAME  = os.getenv("NOTIFY_CHANNEL", "стріми")
+CHECK_INTERVAL       = 300   # секунд між перевірками (5 хв)
+STREAMERS_FILE       = "streamers.json"
+
+streamers_data: dict   = {"youtube": [], "twitch": [], "tiktok": []}
+twitch_token: str      = ""
+twitch_token_expires: float = 0.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Стан
@@ -193,7 +206,7 @@ class RoleView(View):
 # ═══════════════════════════════════════════════════════════════════════════════
 @bot.event
 async def on_ready():
-    load_rooms(); load_teams()
+    load_rooms(); load_teams(); load_streamers()
     bot.add_view(RoleView())
 
     # Синхронізуємо slash-команди на конкретний сервер (миттєво)
@@ -210,6 +223,7 @@ async def on_ready():
     print(f"[✓] Бот: {bot.user} | Сервер: {guild.name} | {TEAM_SIZE}v{TEAM_SIZE}")
     await _post_role_buttons(guild)
     cleanup_loop.start()
+    notify_loop.start()
     print("[✓] Бот готовий!")
 
 
@@ -721,11 +735,487 @@ async def cmd_help(ctx):
         "`!announce Текст`\n"
         "`!gg`"
     ))
+    embed.add_field(name="📡 Сповіщення про стріми", inline=False, value=(
+        "`!addstreamer youtube Назва UCxxxxxx`\n"
+        "`!addstreamer twitch нік`\n"
+        "`!addstreamer tiktok @нік`\n"
+        "`!removestreamer youtube/twitch/tiktok нік`\n"
+        "`!streamers` — список всіх\n"
+        "`!checkstreams` — перевірити зараз (адмін)"
+    ))
     embed.set_footer(text="SkillOFF and KO • Tank Company Tournament")
     await ctx.reply(embed=embed)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Конфіг сповіщень ────────────────────────────────────────────────────────
+
+# Файл зі списком стрімерів і переглянутими відео
+STREAMERS_FILE = "streamers.json"
+
+# Структура streamers.json:
+# {
+#   "youtube":  [{"name": "SkillOFF", "channel_id": "UCxxxxxx", "last_video": ""}],
+#   "twitch":   [{"name": "skilloff_ua", "last_live": false}],
+#   "tiktok":   [{"name": "skilloff.ua", "last_video": ""}]
+# }
+
+streamers_data: dict = {"youtube": [], "twitch": [], "tiktok": []}
+twitch_token: str = ""
+
+
+# ── Збереження / завантаження ─────────────────────────────────────────────────
+def load_streamers():
+    global streamers_data
+    if os.path.exists(STREAMERS_FILE):
+        try:
+            with open(STREAMERS_FILE, encoding="utf-8") as f:
+                streamers_data = json.load(f)
+            # Переконуємось що всі ключі є
+            for k in ("youtube", "twitch", "tiktok"):
+                streamers_data.setdefault(k, [])
+            total = sum(len(v) for v in streamers_data.values())
+            print(f"[✓] Стрімери завантажено: {total}")
+        except Exception as e:
+            print(f"[!] streamers load: {e}")
+
+def save_streamers():
+    with open(STREAMERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(streamers_data, f, ensure_ascii=False, indent=2)
+
+
+# ── Отримати канал для сповіщень ──────────────────────────────────────────────
+def _notify_ch(guild):
+    return discord.utils.find(
+        lambda c: NOTIFY_CHANNEL_NAME.lower() in c.name.lower(),
+        guild.text_channels
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# YOUTUBE — через RSS (без API ключа)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def check_youtube():
+    """Перевіряє нові відео/стріми на YouTube через RSS."""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild: return
+
+    for streamer in streamers_data.get("youtube", []):
+        try:
+            channel_id = streamer.get("channel_id", "")
+            if not channel_id:
+                continue
+
+            rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        continue
+                    content = await resp.text()
+
+            feed = feedparser.parse(content)
+            if not feed.entries:
+                continue
+
+            latest = feed.entries[0]
+            video_id  = latest.get("yt_videoid", "")
+            video_url = f"https://youtube.com/watch?v={video_id}"
+            title     = latest.get("title", "Нове відео")
+
+            # Перевіряємо чи вже сповіщали
+            if video_id == streamer.get("last_video", ""):
+                continue
+
+            streamer["last_video"] = video_id
+            save_streamers()
+
+            # Визначаємо чи це стрім
+            is_live = "live" in title.lower() or "стрім" in title.lower() or "stream" in title.lower()
+
+            embed = discord.Embed(
+                title=f"{'🔴 LIVE' if is_live else '🎬 Нове відео'} — {streamer['name']}",
+                description=f"**{title}**",
+                url=video_url,
+                color=discord.Color.from_rgb(255, 0, 0)  # YouTube червоний
+            )
+            embed.set_author(
+                name=streamer["name"],
+                icon_url="https://www.youtube.com/favicon.ico"
+            )
+
+            # Thumbnail через oEmbed
+            thumb = latest.get("media_thumbnail", [{}])
+            if thumb and isinstance(thumb, list):
+                embed.set_image(url=thumb[0].get("url", ""))
+
+            embed.add_field(name="📺 Платформа", value="YouTube", inline=True)
+            embed.add_field(name="🔗 Посилання", value=video_url, inline=True)
+            embed.set_footer(text="SkillOFF and KO • Сповіщення")
+            embed.timestamp = datetime.now()
+
+            ch = _notify_ch(guild)
+            if ch:
+                mention = "@everyone" if is_live else "@here"
+                await ch.send(mention, embed=embed)
+                print(f"[YT] {'LIVE' if is_live else 'Відео'}: {streamer['name']} — {title}")
+
+        except Exception as e:
+            print(f"[!] YouTube {streamer.get('name')}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TWITCH — через офіційний API
+# ═══════════════════════════════════════════════════════════════════════════════
+async def get_twitch_token():
+    """Отримує/оновлює App Access Token для Twitch API."""
+    global twitch_token, twitch_token_expires
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return False
+    import time
+    if twitch_token and time.time() < twitch_token_expires - 60:
+        return True
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://id.twitch.tv/oauth2/token",
+                params={
+                    "client_id":     TWITCH_CLIENT_ID,
+                    "client_secret": TWITCH_CLIENT_SECRET,
+                    "grant_type":    "client_credentials",
+                }
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[!] Twitch token error: {resp.status}")
+                    return False
+                data = await resp.json()
+                twitch_token = data["access_token"]
+                import time as _t
+                twitch_token_expires = _t.time() + data.get("expires_in", 3600)
+                return True
+    except Exception as e:
+        print(f"[!] Twitch token: {e}")
+        return False
+
+
+async def check_twitch():
+    """Перевіряє чи стрімер онлайн на Twitch."""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild: return
+    if not await get_twitch_token(): return
+
+    for streamer in streamers_data.get("twitch", []):
+        try:
+            login = streamer.get("name", "").lower()
+            if not login: continue
+
+            headers = {
+                "Client-ID":     TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {twitch_token}",
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.twitch.tv/helix/streams",
+                    params={"user_login": login},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status != 200: continue
+                    data = await resp.json()
+
+            streams = data.get("data", [])
+            is_live = len(streams) > 0
+            was_live = streamer.get("last_live", False)
+
+            if is_live and not was_live:
+                # Тільки щойно почав стрімити
+                stream_info = streams[0]
+                title       = stream_info.get("title", "Без назви")
+                game        = stream_info.get("game_name", "")
+                viewers     = stream_info.get("viewer_count", 0)
+                thumbnail   = stream_info.get("thumbnail_url", "").replace("{width}", "1280").replace("{height}", "720")
+                stream_url  = f"https://twitch.tv/{login}"
+
+                embed = discord.Embed(
+                    title=f"🟣 {streamer['name']} тепер LIVE на Twitch!",
+                    description=f"**{title}**",
+                    url=stream_url,
+                    color=discord.Color.from_rgb(145, 70, 255)  # Twitch фіолетовий
+                )
+                embed.set_author(
+                    name=streamer["name"],
+                    icon_url="https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c1.png"
+                )
+                if thumbnail:
+                    embed.set_image(url=thumbnail + f"?t={int(datetime.now().timestamp())}")
+                if game:
+                    embed.add_field(name="🎮 Гра", value=game, inline=True)
+                embed.add_field(name="👥 Глядачів", value=str(viewers), inline=True)
+                embed.add_field(name="🔗 Дивитись", value=stream_url, inline=True)
+                embed.set_footer(text="SkillOFF and KO • Сповіщення")
+                embed.timestamp = datetime.now()
+
+                ch = _notify_ch(guild)
+                if ch:
+                    await ch.send("@everyone 🔴", embed=embed)
+                    print(f"[TW] LIVE: {streamer['name']} — {title}")
+
+                streamer["last_live"] = True
+                save_streamers()
+
+            elif not is_live and was_live:
+                streamer["last_live"] = False
+                save_streamers()
+                print(f"[TW] Офлайн: {streamer['name']}")
+
+        except Exception as e:
+            print(f"[!] Twitch {streamer.get('name')}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIKTOK — через RSS від proxitok (без офіційного API)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def check_tiktok():
+    """Перевіряє нові відео на TikTok через RSS проксі."""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild: return
+
+    # Публічні RSS проксі для TikTok (якщо один не працює — пробує інший)
+    RSS_PROXIES = [
+        "https://proxitok.pabloferreiro.es/@{username}/rss",
+        "https://tok.itsmeow.cat/@{username}/rss",
+    ]
+
+    for streamer in streamers_data.get("tiktok", []):
+        try:
+            username = streamer.get("name", "").lstrip("@")
+            if not username: continue
+
+            feed = None
+            for proxy in RSS_PROXIES:
+                url = proxy.format(username=username)
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                feed = feedparser.parse(content)
+                                if feed.entries:
+                                    break
+                except:
+                    continue
+
+            if not feed or not feed.entries:
+                continue
+
+            latest = feed.entries[0]
+            video_id  = latest.get("id", latest.get("link", ""))
+            title     = latest.get("title", "Нове відео")
+            video_url = latest.get("link", f"https://tiktok.com/@{username}")
+
+            if video_id == streamer.get("last_video", ""):
+                continue
+
+            streamer["last_video"] = video_id
+            save_streamers()
+
+            embed = discord.Embed(
+                title=f"🎵 Нове TikTok відео — {streamer['name']}",
+                description=f"**{title}**",
+                url=video_url,
+                color=discord.Color.from_rgb(0, 0, 0)  # TikTok чорний
+            )
+            embed.set_author(name=f"@{username}")
+            embed.add_field(name="📱 Платформа", value="TikTok", inline=True)
+            embed.add_field(name="🔗 Переглянути", value=video_url, inline=True)
+            embed.set_footer(text="SkillOFF and KO • Сповіщення")
+            embed.timestamp = datetime.now()
+
+            ch = _notify_ch(guild)
+            if ch:
+                await ch.send("@here", embed=embed)
+                print(f"[TT] Нове відео: {streamer['name']} — {title}")
+
+        except Exception as e:
+            print(f"[!] TikTok {streamer.get('name')}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Фоновий цикл перевірки
+# ═══════════════════════════════════════════════════════════════════════════════
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def notify_loop():
+    await check_youtube()
+    await check_twitch()
+    await check_tiktok()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КОМАНДИ КЕРУВАННЯ СТРІМЕРАМИ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# !addstreamer youtube НазваДляПоказу ID_Каналу
+# !addstreamer twitch НікТвіч
+# !addstreamer tiktok @нік
+
+@bot.command(name="addstreamer")
+async def cmd_add_streamer(ctx, platform: str, *args):
+    """
+    !addstreamer youtube НазваДляПоказу UCxxxxx — додати YouTube канал
+    !addstreamer twitch НікТвіч              — додати Twitch стрімера
+    !addstreamer tiktok @нік                 — додати TikTok акаунт
+
+    Де взяти YouTube Channel ID:
+      Відкрийте канал → About → Share → Copy channel ID
+      Або з URL: youtube.com/channel/UCxxxxxx
+    """
+    if not ctx.author.guild_permissions.administrator and not discord.utils.find(
+            lambda r: any(k in r.name for k in ("Адмін","Суддя")), ctx.author.roles):
+        await ctx.reply("❌ Тільки адмін або суддя.", delete_after=6); return
+
+    platform = platform.lower()
+    if platform not in ("youtube", "twitch", "tiktok"):
+        await ctx.reply(
+            "❌ Платформа має бути: `youtube`, `twitch` або `tiktok`\n"
+            "Приклади:\n"
+            "`!addstreamer youtube SkillOFF UCabcd1234`\n"
+            "`!addstreamer twitch skilloff_ua`\n"
+            "`!addstreamer tiktok @skilloff.ua`"
+        ); return
+
+    if platform == "youtube":
+        if len(args) < 2:
+            await ctx.reply(
+                "⚠️ Формат: `!addstreamer youtube НазваДляПоказу ID_Каналу`\n"
+                "Channel ID виглядає як: `UCabcdef1234567890`\n"
+                "Знайти: відкрийте канал → About → Share → Copy channel ID"
+            ); return
+        display_name = args[0]
+        channel_id   = args[1]
+        if not channel_id.startswith("UC"):
+            await ctx.reply(
+                "⚠️ Channel ID має починатись з `UC`\n"
+                "Наприклад: `UCabcdef1234567890`"
+            ); return
+        # Перевірка дублікату
+        if any(s["channel_id"] == channel_id for s in streamers_data["youtube"]):
+            await ctx.reply(f"ℹ️ YouTube канал **{display_name}** вже є в списку."); return
+        streamers_data["youtube"].append({
+            "name": display_name, "channel_id": channel_id, "last_video": ""
+        })
+        save_streamers()
+        await ctx.reply(
+            f"✅ Додано YouTube канал **{display_name}**\n"
+            f"ID: `{channel_id}`\n"
+            f"Сповіщення будуть у <#{_notify_ch(ctx.guild).id if _notify_ch(ctx.guild) else 'стріми'}>"
+        )
+
+    elif platform == "twitch":
+        if len(args) < 1:
+            await ctx.reply("⚠️ Формат: `!addstreamer twitch нік_на_твічі`"); return
+        login = args[0].lower().lstrip("@")
+        if any(s["name"].lower() == login for s in streamers_data["twitch"]):
+            await ctx.reply(f"ℹ️ Twitch **{login}** вже є в списку."); return
+        streamers_data["twitch"].append({"name": login, "last_live": False})
+        save_streamers()
+        tw_ok = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET)
+        warn  = "" if tw_ok else "\n⚠️ Twitch API не налаштований! Додайте `TWITCH_CLIENT_ID` і `TWITCH_CLIENT_SECRET` у Variables."
+        await ctx.reply(f"✅ Додано Twitch стрімера **{login}**{warn}")
+
+    elif platform == "tiktok":
+        if len(args) < 1:
+            await ctx.reply("⚠️ Формат: `!addstreamer tiktok @нік`"); return
+        nick = args[0].lstrip("@")
+        if any(s["name"] == nick for s in streamers_data["tiktok"]):
+            await ctx.reply(f"ℹ️ TikTok **@{nick}** вже є в списку."); return
+        streamers_data["tiktok"].append({"name": nick, "last_video": ""})
+        save_streamers()
+        await ctx.reply(
+            f"✅ Додано TikTok **@{nick}**\n"
+            "⚠️ TikTok використовує сторонній RSS — може бути нестабільним."
+        )
+    print(f"[+] Стрімер додано: {platform} — {args}")
+
+
+@bot.command(name="removestreamer")
+async def cmd_remove_streamer(ctx, platform: str, *, name: str):
+    """!removestreamer youtube/twitch/tiktok НазваАбоНік"""
+    if not ctx.author.guild_permissions.administrator and not discord.utils.find(
+            lambda r: any(k in r.name for k in ("Адмін","Суддя")), ctx.author.roles):
+        await ctx.reply("❌ Тільки адмін.", delete_after=6); return
+
+    platform = platform.lower()
+    name_clean = name.lower().lstrip("@")
+    original_count = len(streamers_data.get(platform, []))
+
+    streamers_data[platform] = [
+        s for s in streamers_data.get(platform, [])
+        if s.get("name","").lower() != name_clean
+        and s.get("channel_id","").lower() != name_clean
+    ]
+
+    if len(streamers_data[platform]) < original_count:
+        save_streamers()
+        await ctx.reply(f"🗑️ **{name}** видалено зі списку {platform}.")
+    else:
+        await ctx.reply(f"❌ **{name}** не знайдено в списку {platform}.")
+
+
+@bot.command(name="streamers")
+async def cmd_list_streamers(ctx):
+    """!streamers — список всіх доданих стрімерів"""
+    embed = discord.Embed(
+        title="📡 Список стрімерів для сповіщень",
+        color=discord.Color.from_rgb(88, 101, 242)
+    )
+
+    yt = streamers_data.get("youtube", [])
+    tw = streamers_data.get("twitch", [])
+    tt = streamers_data.get("tiktok", [])
+
+    if yt:
+        lines = [f"▶️ **{s['name']}** (`{s['channel_id']}`)" for s in yt]
+        embed.add_field(name=f"🔴 YouTube ({len(yt)})", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🔴 YouTube", value="*немає*", inline=False)
+
+    if tw:
+        lines = [f"🟢 **{s['name']}**" + (" (LIVE)" if s.get("last_live") else "") for s in tw]
+        embed.add_field(name=f"🟣 Twitch ({len(tw)})", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🟣 Twitch", value="*немає*", inline=False)
+
+    if tt:
+        lines = [f"🎵 **@{s['name']}**" for s in tt]
+        embed.add_field(name=f"⚫ TikTok ({len(tt)})", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="⚫ TikTok", value="*немає*", inline=False)
+
+    ch = _notify_ch(ctx.guild)
+    embed.set_footer(text=f"Канал сповіщень: #{ch.name if ch else NOTIFY_CHANNEL_NAME} • перевірка кожні {CHECK_INTERVAL//60} хв")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="checkstreams")
+async def cmd_check_now(ctx):
+    """!checkstreams — перевірити всі платформи прямо зараз (адмін)"""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.reply("❌ Тільки адмін.", delete_after=5); return
+    await ctx.reply("🔄 Перевіряємо всі платформи...")
+    await check_youtube()
+    await check_twitch()
+    await check_tiktok()
+    await ctx.reply("✅ Перевірку завершено. Нові сповіщення відправлені якщо є.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ЗАПУСК ЦИКЛУ (додати в on_ready після cleanup_loop.start())
+# notify_loop.start()
+# load_streamers()   ← додати перед bot.run()
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("=" * 50)
